@@ -11,3 +11,4 @@ vhdl_lang = "0.17.0"
 handlebars = "3.5.4"
 serde = { version = "1.0", features = ["derive"] }
 petgraph = "0.5.1"
+indexmap = "1.6.2"

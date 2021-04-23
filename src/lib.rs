@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::cell::{Ref, RefCell};
+use std::path::PathBuf;
 use handlebars::Handlebars;
 use serde::Serialize;
+use indexmap::{indexset, IndexSet};
 // use petgraph::graph::{Graph, UnGraph, NodeIndex};
 
 pub struct Entity {
@@ -20,7 +23,55 @@ pub enum Arch {
 
 pub struct Symbol;
 
-pub struct Configuration;
+pub struct Configuration<S: Simulator> {
+    /// The simulator to target
+    pub sim: S,
+    /// The entity to synthesize
+    pub ent: Rc<Entity>,
+    /// The architecture to use for this entity.
+    /// If None, a default from all is used, or the first that matches the simulator
+    pub arch: Option<String>,
+    // The configuration for a sub-instance
+    pub for_inst: RefCell<HashMap<String, Configuration<S>>>,
+    /// For all Entity => Arch.
+    /// Weakest specification.
+    pub all: HashMap<String, String>,
+}
+
+impl<S> Configuration<S> where S: Simulator {
+    fn get_arch(&self) -> Option<&Arch> {
+        if let Some(arch) = &self.arch { // directly specified
+            self.ent.archs.get(arch)
+        } else if let Some(arch) = self.all.get(&self.ent.name) { // entity specified
+            self.ent.archs.get(arch)
+        } else { // find the first one that supports this sim
+            for (_name, arch) in &self.ent.archs {
+                match arch {
+                    Arch::Code(cda) => if self.sim.get_dialect(cda).is_some() {
+                        return Some(arch);
+                    }
+                    Arch::Schematic(_) => return Some(arch)
+                }
+            }
+            None
+        }
+    }
+
+    /// Gets the configuration for a certain instance.
+    /// If no configuration is given for this instance,
+    /// a default configuration is created with a copy of
+    /// the per-entity defaults
+    fn get_conf(&self, name: &str, inst: &Instance) -> Ref<Configuration<S>> {
+        self.for_inst.borrow_mut().entry(name.into()).or_insert_with(|| Configuration {
+            sim: self.sim,
+            ent: inst.entity.clone(),
+            arch: None,
+            for_inst: RefCell::from(HashMap::new()),
+            all: self.all.clone(),
+        });
+        Ref::map(self.for_inst.borrow(), |inst| &inst[name.into()])
+    }
+}
 
 // TODO instances and schematics require a complete rework for GUI interface
 pub struct Instance {
@@ -35,32 +86,19 @@ pub struct Schematic {
     pub instances: HashMap<String, Instance>,
 }
 
-// TODO rewrite with configurations
-impl Code for Ngspice<&Schematic> {
-    fn definition(&self) -> Result<String, CodeError> {
-        let sch = self.0;
-        let mut code = String::new();
-        // Don't repeat models... globaly!
-        // Do at the configuration level?
-        for (_name, inst) in &sch.instances {
-            match &inst.entity.archs["rtl"] { // configuration!!
-                Arch::Code(arch) => code.push_str(&Ngspice(arch).definition()?),
-                Arch::Schematic(arch) => code.push_str(&Ngspice(arch).definition()?)
-            }
-           code.push_str("\n");
-        }
-        for (name, inst) in &sch.instances {
-            match &inst.entity.archs["rtl"] { // configuration!!
-                Arch::Code(arch) => code.push_str(&Ngspice(arch).reference(name, &inst.genericmap, &inst.portmap)?),
-                Arch::Schematic(arch) => code.push_str(&Ngspice(arch).definition()?)
-            }
-           code.push_str("\n");
-        }
-        Ok(code)
-    }
-    fn reference(&self, _name: &str, _genericmap: &HashMap<String, String>, _portmap: &HashMap<String, String>) -> Result<String, CodeError> {
-        Err(CodeError::DialectError)
-    }
+/// Represents a component that can be expressed in code.
+/// For example, a spice model/subcircuit or a VHDL architecture.
+pub trait Code {
+    /// The definition of this component.
+    /// The .subckt or architecture code
+    fn definition(&self) -> Result<IndexSet<Definition>, CodeError> { Err(CodeError::DialectError) }
+    /// The declaration, not used in all languages, and by default will return a DialectError.
+    /// In VHDL this is the component declaration in the instantiating architecture.
+    /// Component instantiation is required for configurations
+    fn declaration(&self) -> Result<String, CodeError> { Err(CodeError::DialectError) }
+    /// The reference to a component given the instance name, and the ports and parameters to pass to the component.
+    /// This is used to instantiate a component in another one.
+    fn reference(&self, _name: &str, _genericmap: &HashMap<String, String>, _portmap: &HashMap<String, String>) -> Result<String, CodeError> { Err(CodeError::DialectError) }
 }
 
 #[derive(Debug)]
@@ -68,6 +106,12 @@ pub enum CodeError {
     DialectError,
     CompileError,
     TemplateError(handlebars::TemplateRenderError),
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub enum Definition {
+    Code(String),
+    Library(PathBuf),
 }
 
 impl From<handlebars::TemplateRenderError> for CodeError {
@@ -83,20 +127,15 @@ struct RefArgs<'a> {
     port: &'a HashMap<String, String>,
 }
 
-pub trait Code {
-    fn definition(&self) -> Result<String, CodeError> { Err(CodeError::DialectError) }
-    fn reference(&self, _name: &str, _genericmap: &HashMap<String, String>, _portmap: &HashMap<String, String>) -> Result<String, CodeError> { Err(CodeError::DialectError) }
-}
-
 /// Contains a definition in some language
 /// and a Handlebars template for referencing the definition
-struct CodeArch {
-    definition: String,
+pub struct CodeArch {
+    definition: Definition,
     reference: String,
 }
 
 impl Code for CodeArch {
-    fn definition(&self) -> Result<String, CodeError> { Ok(self.definition.clone()) }
+    fn definition(&self) -> Result<IndexSet<Definition>, CodeError> { Ok(indexset!{self.definition.clone()}) }
     fn reference(&self, name: &str, genericmap: &HashMap<String, String>, portmap: &HashMap<String, String>) -> Result<String, CodeError> {
         let handlebars = Handlebars::new();
         let varmap = RefArgs {name: name, generic: genericmap, port: portmap};
@@ -117,77 +156,96 @@ impl CodeDialectArch {
     }
 }
 
-pub struct Ngspice<T>(T);
+pub trait Simulator: Copy {
+    fn get_dialect<'a>(&self, arch: &'a CodeDialectArch) -> Option<&'a CodeArch>;
+    fn synthesize_definition<S: Simulator>(&self, conf: &Configuration<S>, ckt: &Schematic) -> Result<IndexSet<Definition>, CodeError>;
+    fn synthesize_reference<S: Simulator>(&self, conf: &Configuration<S>, name: &str, genericmap: &HashMap<String, String>, portmap: &HashMap<String, String>) -> Result<String, CodeError>;
+}
 
-pub struct Xyce<T>(T);
+fn spice_definition<S: Simulator>(sch: &Schematic, conf: &Configuration<S>) -> Result<IndexSet<Definition>, CodeError> {
+    let mut defs = IndexSet::new();
+    for (name, inst) in &sch.instances {
+        let subconf = conf.get_conf(name, inst);
+        // add to ordered set to avoid duplicates but maintain dependency order
+        defs.extend(subconf.definition()?)
+    }
+    let mut res = String::new();
+    // for def in defs {
+    //     match def {
+    //         Definition::Code(code) => res.push_str(&code),
+    //         Definition::Library(path) => res.push_str(format!(".lib {}", path.to_str().ok_or(CodeError::CompileError)?))
+    //     }
+    //     res.push_str("\n");
+    // }
+    for (name, inst) in &sch.instances {
+        let subconf = conf.get_conf(name, inst);
+        res.push_str(&subconf.reference(name, &inst.genericmap, &inst.portmap)?);
+        res.push('\n');
+    }
+    defs.insert(Definition::Code(res));
+    Ok(defs)
+}
+fn spice_reference<S: Simulator>(conf: &Configuration<S>, name: &str, genericmap: &HashMap<String, String>, portmap: &HashMap<String, String>) -> Result<String, CodeError> {
+    let mut res = String::with_capacity(64);
+    res.push('X');
+    res.push_str(name);
+    // order matters
+    for p in &conf.ent.port {
+        res.push(' ');
+        res.push_str(portmap.get(p).ok_or(CodeError::CompileError)?)
+    }
+    res.push(' ');
+    res.push_str(&conf.ent.name);
+    for g in &conf.ent.generic {
+        res.push(' ');
+        res.push_str(g);
+        res.push('=');
+        res.push_str(genericmap.get(g).ok_or(CodeError::CompileError)?)
+    }
+    res.push('\n');
+    Ok(res)
+}
 
-pub struct Verilator<T>(T);
+
+#[derive(Copy, Clone)]
+pub struct Ngspice;
+
+impl Simulator for Ngspice {
+    fn get_dialect<'a>(&self, arch: &'a CodeDialectArch) -> Option<&'a CodeArch> {
+        arch.dialects.get("ngspice").or_else(|| arch.dialects.get("spice"))
+    }
+    fn synthesize_definition<S: Simulator>(&self, conf: &Configuration<S>, ckt: &Schematic) -> Result<IndexSet<Definition>, CodeError> {
+        spice_definition(ckt, conf)
+    }
+    fn synthesize_reference<S: Simulator>(&self, conf: &Configuration<S>, name: &str, genericmap: &HashMap<String, String>, portmap: &HashMap<String, String>) -> Result<String, CodeError> {
+        spice_reference(conf, name, genericmap, portmap)
+    }
+}
+
+// pub struct Xyce;
+// pub struct Verilator;
+// pub struct GHDL;
 
 // CXXRTL takes anything Yosys can read plus C++
-// pub struct CXXRTL<T>(T);
-
-pub struct GHDL<T>(T);
+// pub struct CXXRTL;
 
 // nMigen takes Python files
-// pub struct NMigen<T>(T);
+// pub struct NMigen;
 
-impl Code for Ngspice<&CodeDialectArch> {
-    fn definition(&self) -> Result<String, CodeError> {
-        let arch = self.0.dialects.get("ngspice")
-            .or_else(|| self.0.dialects.get("spice"))
-            .ok_or(CodeError::DialectError)?;
-        arch.definition()
+impl<S: Simulator> Code for Configuration<S> {
+    fn definition(&self) -> Result<IndexSet<Definition>, CodeError> {
+        match self.get_arch() {
+            Some(Arch::Code(arch)) => self.sim.get_dialect(arch).ok_or(CodeError::DialectError)?.definition(),
+            Some(Arch::Schematic(sch)) => self.sim.synthesize_definition(self, sch),
+            None => Err(CodeError::DialectError)
+        }
     }
     fn reference(&self, name: &str, genericmap: &HashMap<String, String>, portmap: &HashMap<String, String>) -> Result<String, CodeError> {
-        let arch = self.0.dialects.get("ngspice")
-            .or_else(|| self.0.dialects.get("spice"))
-            .ok_or(CodeError::DialectError)?;
-        arch.reference(name, genericmap, portmap)
-    }
-}
-
-impl Code for Xyce<&CodeDialectArch> {
-    fn definition(&self) -> Result<String, CodeError> {
-        let arch = self.0.dialects.get("xyce")
-            .or_else(|| self.0.dialects.get("spice"))
-            .ok_or(CodeError::DialectError)?;
-        arch.definition()
-    }
-    fn reference(&self, name: &str, genericmap: &HashMap<String, String>, portmap: &HashMap<String, String>) -> Result<String, CodeError> {
-        let arch = self.0.dialects.get("xyce")
-            .or_else(|| self.0.dialects.get("spice"))
-            .ok_or(CodeError::DialectError)?;
-        arch.reference(name, genericmap, portmap)
-    }
-}
-
-impl Code for GHDL<&CodeDialectArch> {
-    fn definition(&self) -> Result<String, CodeError> {
-        let arch = self.0.dialects.get("ghdl")
-            .or_else(|| self.0.dialects.get("vhdl"))
-            .ok_or(CodeError::DialectError)?;
-        arch.definition()
-    }
-    fn reference(&self, name: &str, genericmap: &HashMap<String, String>, portmap: &HashMap<String, String>) -> Result<String, CodeError> {
-        let arch = self.0.dialects.get("ghdl")
-            .or_else(|| self.0.dialects.get("vhdl"))
-            .ok_or(CodeError::DialectError)?;
-        arch.reference(name, genericmap, portmap)
-    }
-}
-
-impl Code for Verilator<&CodeDialectArch> {
-    fn definition(&self) -> Result<String, CodeError> {
-        let arch = self.0.dialects.get("verilator")
-            .or_else(|| self.0.dialects.get("verilog"))
-            .ok_or(CodeError::DialectError)?;
-        arch.definition()
-    }
-    fn reference(&self, name: &str, genericmap: &HashMap<String, String>, portmap: &HashMap<String, String>) -> Result<String, CodeError> {
-        let arch = self.0.dialects.get("verilator")
-            .or_else(|| self.0.dialects.get("verilog"))
-            .ok_or(CodeError::DialectError)?;
-        arch.reference(name, genericmap, portmap)
+        match self.get_arch() {
+            Some(Arch::Code(arch)) => self.sim.get_dialect(arch).ok_or(CodeError::DialectError)?.reference(name, genericmap, portmap),
+            Some(Arch::Schematic(_sch)) => self.sim.synthesize_reference(self, name, genericmap, portmap),
+            None => Err(CodeError::DialectError)
+        }
     }
 }
 
@@ -214,7 +272,7 @@ mod tests {
     fn circuit() {
         let code = CodeArch {
             reference: "m{{name}} {{port.d}} {{port.g}} {{port.s}} {{port.b}} PMOS W={{generic.w}} L={{generic.l}}".into(),
-            definition: ".model PMOS".into()
+            definition: Definition::Code(".model PMOS".into())
         };
         let mut spicemos = CodeDialectArch::new();
         spicemos.dialects.insert("spice".into(), code);
@@ -231,7 +289,7 @@ mod tests {
 
         let code = CodeArch {
             reference: "m{{name}} {{port.d}} {{port.g}} {{port.s}} {{port.b}} NMOS W={{generic.w}} L={{generic.l}}".to_string(),
-            definition: ".model NMOS".into()
+            definition: Definition::Code(".model NMOS".into())
         };
         let mut spicemos = CodeDialectArch::new();
         spicemos.dialects.insert("spice".into(), code);
@@ -306,66 +364,82 @@ mod tests {
                     y: 0,
                     entity: nmos.clone(),
                 });
-        println!("{}", Ngspice(&cir).definition().unwrap());
-        assert_eq!(Ngspice(&cir).definition().unwrap(), "");
+        let top = Entity {
+            name: "buf".into(),
+            symbol: Symbol {},
+            port: vec!["vcc".into(), "gnd".into(), "in".into(), "out".into()],
+            generic: Vec::new(),
+            archs: collection!{"default".into() => Arch::Schematic(cir)},
+        };
+        let conf = Configuration {
+            sim: Ngspice,
+            ent: Rc::from(top),
+            arch: Some("default".into()),
+            for_inst: RefCell::from(HashMap::new()),
+            all: HashMap::new(),
+        };
+        println!("{:?}", conf.definition().unwrap());
+        // assert_eq!(Ngspice(&cir).definition().unwrap(), "");
     }
 
     #[test]
     fn code_arch() {
-        let code = CodeArch { reference: "{{generic.name}}, {{port.platitude}}".to_string(), definition: "hello".into()};
+        let code = CodeArch {
+            reference: "{{generic.name}}, {{port.platitude}}".to_string(),
+            definition: Definition::Code("hello".into())};
         let mut generics = HashMap::new();
         generics.insert("name".to_string(), "world".to_string());
         let mut ports = HashMap::new();
         ports.insert("platitude".to_string(), "whatsup".to_string());
-        assert_eq!(code.definition().unwrap(), "hello");
+        assert_eq!(code.definition().unwrap(), indexset!{Definition::Code("hello".into())});
         assert_eq!(code.reference("foo", &generics, &ports).unwrap(), "world, whatsup");
     }
 
-    #[test]
-    fn spice_arch() {
-        let mut spice = CodeDialectArch::new();
-        spice.dialects.insert("spice".into(), CodeArch {definition: "this is spice".into(), reference: "spice ref".into()});
-        spice.dialects.insert("ngspice".into(), CodeArch {definition: "this is ngspice".into(), reference: "ngspice ref".into()});
-        assert_eq!(Ngspice(&spice).definition().unwrap(), "this is ngspice");
-        assert_eq!(Xyce(&spice).definition().unwrap(), "this is spice");
-        assert_eq!(Ngspice(&spice).reference("foo", &HashMap::new(), &HashMap::new()).unwrap(), "ngspice ref");
-        assert_eq!(Xyce(&spice).reference("bar", &HashMap::new(), &HashMap::new()).unwrap(), "spice ref");
+    // #[test]
+    // fn spice_arch() {
+    //     let mut spice = CodeDialectArch::new();
+    //     spice.dialects.insert("spice".into(), CodeArch {definition: "this is spice".into(), reference: "spice ref".into()});
+    //     spice.dialects.insert("ngspice".into(), CodeArch {definition: "this is ngspice".into(), reference: "ngspice ref".into()});
+    //     assert_eq!(Ngspice(&spice).definition().unwrap(), "this is ngspice");
+    //     assert_eq!(Xyce(&spice).definition().unwrap(), "this is spice");
+    //     assert_eq!(Ngspice(&spice).reference("foo", &HashMap::new(), &HashMap::new()).unwrap(), "ngspice ref");
+    //     assert_eq!(Xyce(&spice).reference("bar", &HashMap::new(), &HashMap::new()).unwrap(), "spice ref");
 
 
-        let mut spice = CodeDialectArch::new();
-        spice.dialects.insert("spice".into(), CodeArch {definition: "this is spice".into(), reference: "spice ref".into()});
-        spice.dialects.insert("xyce".into(), CodeArch {definition: "this is xyce".into(), reference: "xyce ref".into()});
-        assert_eq!(Ngspice(&spice).definition().unwrap(), "this is spice");
-        assert_eq!(Xyce(&spice).definition().unwrap(), "this is xyce");
-        assert_eq!(Ngspice(&spice).reference("foo", &HashMap::new(), &HashMap::new()).unwrap(), "spice ref");
-        assert_eq!(Xyce(&spice).reference("bar", &HashMap::new(), &HashMap::new()).unwrap(), "xyce ref");
-    }
+    //     let mut spice = CodeDialectArch::new();
+    //     spice.dialects.insert("spice".into(), CodeArch {definition: "this is spice".into(), reference: "spice ref".into()});
+    //     spice.dialects.insert("xyce".into(), CodeArch {definition: "this is xyce".into(), reference: "xyce ref".into()});
+    //     assert_eq!(Ngspice(&spice).definition().unwrap(), "this is spice");
+    //     assert_eq!(Xyce(&spice).definition().unwrap(), "this is xyce");
+    //     assert_eq!(Ngspice(&spice).reference("foo", &HashMap::new(), &HashMap::new()).unwrap(), "spice ref");
+    //     assert_eq!(Xyce(&spice).reference("bar", &HashMap::new(), &HashMap::new()).unwrap(), "xyce ref");
+    // }
 
-    #[test]
-    fn verilator_arch() {
-        let mut verilog = CodeDialectArch::new();
-        verilog.dialects.insert("verilog".into(), CodeArch {definition: "this is verilog".into(), reference: "verilog ref".into()});
-        assert_eq!(Verilator(&verilog).definition().unwrap(), "this is verilog");
-        assert_eq!(Verilator(&verilog).reference("foo", &HashMap::new(), &HashMap::new()).unwrap(), "verilog ref");
+    // #[test]
+    // fn verilator_arch() {
+    //     let mut verilog = CodeDialectArch::new();
+    //     verilog.dialects.insert("verilog".into(), CodeArch {definition: "this is verilog".into(), reference: "verilog ref".into()});
+    //     assert_eq!(Verilator(&verilog).definition().unwrap(), "this is verilog");
+    //     assert_eq!(Verilator(&verilog).reference("foo", &HashMap::new(), &HashMap::new()).unwrap(), "verilog ref");
 
-        verilog.dialects.insert("verilator".into(), CodeArch {definition: "this is verilator".into(), reference: "verilator ref".into()});
-        assert_eq!(Verilator(&verilog).definition().unwrap(), "this is verilator");
-        assert_eq!(Verilator(&verilog).reference("foo", &HashMap::new(), &HashMap::new()).unwrap(), "verilator ref");
-        assert_eq!(Ngspice(&verilog).definition().is_err(), true);
-    }
+    //     verilog.dialects.insert("verilator".into(), CodeArch {definition: "this is verilator".into(), reference: "verilator ref".into()});
+    //     assert_eq!(Verilator(&verilog).definition().unwrap(), "this is verilator");
+    //     assert_eq!(Verilator(&verilog).reference("foo", &HashMap::new(), &HashMap::new()).unwrap(), "verilator ref");
+    //     assert_eq!(Ngspice(&verilog).definition().is_err(), true);
+    // }
 
-    #[test]
-    fn ghdl_arch() {
-        let mut vhdl = CodeDialectArch::new();
-        vhdl.dialects.insert("vhdl".into(), CodeArch {definition: "this is vhdl".into(), reference: "vhdl ref".into()});
-        assert_eq!(GHDL(&vhdl).definition().unwrap(), "this is vhdl");
-        assert_eq!(GHDL(&vhdl).reference("foo", &HashMap::new(), &HashMap::new()).unwrap(), "vhdl ref");
+    // #[test]
+    // fn ghdl_arch() {
+    //     let mut vhdl = CodeDialectArch::new();
+    //     vhdl.dialects.insert("vhdl".into(), CodeArch {definition: "this is vhdl".into(), reference: "vhdl ref".into()});
+    //     assert_eq!(GHDL(&vhdl).definition().unwrap(), "this is vhdl");
+    //     assert_eq!(GHDL(&vhdl).reference("foo", &HashMap::new(), &HashMap::new()).unwrap(), "vhdl ref");
 
-        vhdl.dialects.insert("ghdl".into(), CodeArch {definition: "this is ghdl".into(), reference: "ghdl ref".into()});
-        assert_eq!(GHDL(&vhdl).definition().unwrap(), "this is ghdl");
-        assert_eq!(GHDL(&vhdl).reference("foo", &HashMap::new(), &HashMap::new()).unwrap(), "ghdl ref");
-        assert_eq!(Xyce(&vhdl).definition().is_err(), true);
-    }
+    //     vhdl.dialects.insert("ghdl".into(), CodeArch {definition: "this is ghdl".into(), reference: "ghdl ref".into()});
+    //     assert_eq!(GHDL(&vhdl).definition().unwrap(), "this is ghdl");
+    //     assert_eq!(GHDL(&vhdl).reference("foo", &HashMap::new(), &HashMap::new()).unwrap(), "ghdl ref");
+    //     assert_eq!(Xyce(&vhdl).definition().is_err(), true);
+    // }
 
     #[test]
     fn parse_ent() {
