@@ -5,7 +5,20 @@ use std::path::PathBuf;
 use handlebars::Handlebars;
 use serde::Serialize;
 use indexmap::{indexset, IndexSet};
-// use petgraph::graph::{Graph, UnGraph, NodeIndex};
+
+/// Macro for HashMap literals
+#[macro_export]
+macro_rules! collection {
+    // map-like
+    ($($k:expr => $v:expr),* $(,)?) => {
+        std::iter::Iterator::collect(std::array::IntoIter::new([$(($k, $v),)*]))
+    };
+    // set-like
+    ($($v:expr),* $(,)?) => {
+        std::iter::Iterator::collect(std::array::IntoIter::new([$($v,)*]))
+    };
+}
+
 
 pub struct Entity {
     pub name: String,
@@ -83,6 +96,7 @@ pub struct Instance {
 }
 
 pub struct Schematic {
+    pub toplevel: bool,
     pub instances: HashMap<String, Instance>,
 }
 
@@ -104,7 +118,7 @@ pub trait Code {
 #[derive(Debug)]
 pub enum CodeError {
     DialectError,
-    CompileError,
+    CompileError(String),
     TemplateError(handlebars::TemplateRenderError),
 }
 
@@ -112,6 +126,7 @@ pub enum CodeError {
 pub enum Definition {
     Code(String),
     Library(PathBuf),
+    Primitive,
 }
 
 impl From<handlebars::TemplateRenderError> for CodeError {
@@ -130,8 +145,8 @@ struct RefArgs<'a> {
 /// Contains a definition in some language
 /// and a Handlebars template for referencing the definition
 pub struct CodeArch {
-    definition: Definition,
-    reference: String,
+    pub definition: Definition,
+    pub reference: String,
 }
 
 impl Code for CodeArch {
@@ -147,7 +162,7 @@ impl Code for CodeArch {
 /// Contains multiple dialectso of a given subcircuit/model
 /// Maps from a spice dialect to a definition
 pub struct CodeDialectArch {
-    dialects: HashMap<String, CodeArch>,
+    pub dialects: HashMap<String, CodeArch>,
 }
 
 impl CodeDialectArch {
@@ -164,35 +179,62 @@ pub trait Simulator: Copy {
 
 fn spice_definition<S: Simulator>(sch: &Schematic, conf: &Configuration<S>) -> Result<IndexSet<Definition>, CodeError> {
     let mut defs = IndexSet::new();
-    for (name, inst) in &sch.instances {
-        let subconf = conf.get_conf(name, inst);
-        // add to ordered set to avoid duplicates but maintain dependency order
-        defs.extend(subconf.definition()?)
-    }
-    let mut res = String::new();
-    // for def in defs {
-    //     match def {
-    //         Definition::Code(code) => res.push_str(&code),
-    //         Definition::Library(path) => res.push_str(format!(".lib {}", path.to_str().ok_or(CodeError::CompileError)?))
-    //     }
-    //     res.push_str("\n");
-    // }
-    for (name, inst) in &sch.instances {
-        let subconf = conf.get_conf(name, inst);
-        res.push_str(&subconf.reference(name, &inst.genericmap, &inst.portmap)?);
+    if sch.toplevel {
+        let mut res = String::new();
+        res.push_str(&format!("* {}\n", conf.ent.name));
+        let mut sub_defs = IndexSet::new();
+        for (name, inst) in &sch.instances {
+            let subconf = conf.get_conf(name, inst);
+            // add to ordered set to avoid duplicates but maintain dependency order
+            sub_defs.extend(subconf.definition()?)
+        }
+        for def in sub_defs {
+            match def {
+                Definition::Code(def) => res.push_str(&def),
+                Definition::Library(lib) => res.push_str(&format!(".lib {}", lib.to_str().ok_or(CodeError::CompileError(lib.to_string_lossy().into()))?)),
+                Definition::Primitive => (),
+            }
+            res.push('\n');
+        }
+        for (name, inst) in &sch.instances {
+            let subconf = conf.get_conf(name, inst);
+            res.push_str(&subconf.reference(name, &inst.genericmap, &inst.portmap)?);
+            res.push('\n');
+        }
+        res.push_str(".end\n");
+        defs.insert(Definition::Code(res));
+    } else {
+        for (name, inst) in &sch.instances {
+            let subconf = conf.get_conf(name, inst);
+            // add to ordered set to avoid duplicates but maintain dependency order
+            defs.extend(subconf.definition()?)
+        }
+        let mut res = String::new();
+        res.push_str(&format!(".subckt {}", conf.ent.name));
+        for port in &conf.ent.port {
+            res.push(' ');
+            res.push_str(port);
+        }
         res.push('\n');
+        // TODO parameters
+        for (name, inst) in &sch.instances {
+            let subconf = conf.get_conf(name, inst);
+            res.push_str(&subconf.reference(name, &inst.genericmap, &inst.portmap)?);
+            res.push('\n');
+        }
+        res.push_str(&format!(".ends {}", conf.ent.name));
+        defs.insert(Definition::Code(res));
     }
-    defs.insert(Definition::Code(res));
     Ok(defs)
 }
 fn spice_reference<S: Simulator>(conf: &Configuration<S>, name: &str, genericmap: &HashMap<String, String>, portmap: &HashMap<String, String>) -> Result<String, CodeError> {
     let mut res = String::with_capacity(64);
-    res.push('X');
+    res.push('x');
     res.push_str(name);
     // order matters
     for p in &conf.ent.port {
         res.push(' ');
-        res.push_str(portmap.get(p).ok_or(CodeError::CompileError)?)
+        res.push_str(portmap.get(p).ok_or(CodeError::CompileError(format!("no {} in {}", p, name)))?)
     }
     res.push(' ');
     res.push_str(&conf.ent.name);
@@ -200,9 +242,8 @@ fn spice_reference<S: Simulator>(conf: &Configuration<S>, name: &str, genericmap
         res.push(' ');
         res.push_str(g);
         res.push('=');
-        res.push_str(genericmap.get(g).ok_or(CodeError::CompileError)?)
+        res.push_str(genericmap.get(g).ok_or(CodeError::CompileError(g.into()))?)
     }
-    res.push('\n');
     Ok(res)
 }
 
@@ -255,19 +296,6 @@ mod tests {
     use std::path::Path;
     use super::*;
 
-    /// Macro for HashMap literals
-    macro_rules! collection {
-        // map-like
-        ($($k:expr => $v:expr),* $(,)?) => {
-            std::iter::Iterator::collect(std::array::IntoIter::new([$(($k, $v),)*]))
-        };
-        // set-like
-        ($($v:expr),* $(,)?) => {
-            std::iter::Iterator::collect(std::array::IntoIter::new([$($v,)*]))
-        };
-    }
-
-
     #[test]
     fn circuit() {
         let code = CodeArch {
@@ -305,6 +333,7 @@ mod tests {
         });
 
         let mut cir = Schematic {
+            toplevel: true,
             instances: HashMap::new(),
         };
         cir.instances.insert(
@@ -367,7 +396,7 @@ mod tests {
         let top = Entity {
             name: "buf".into(),
             symbol: Symbol {},
-            port: vec!["vcc".into(), "gnd".into(), "in".into(), "out".into()],
+            port: vec!["vdd".into(), "gnd".into(), "in".into(), "out".into()],
             generic: Vec::new(),
             archs: collection!{"default".into() => Arch::Schematic(cir)},
         };
@@ -378,7 +407,9 @@ mod tests {
             for_inst: RefCell::from(HashMap::new()),
             all: HashMap::new(),
         };
-        println!("{:?}", conf.definition().unwrap());
+        if let Definition::Code(code) = &conf.definition().unwrap()[0] {
+            println!("{}", code);
+        }
         // assert_eq!(Ngspice(&cir).definition().unwrap(), "");
     }
 

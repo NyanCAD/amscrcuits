@@ -4,11 +4,19 @@ version = "0.1.0"
 authors = ["Pepijn de Vos <pepijndevos@gmail.com>"]
 edition = "2018"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 vhdl_lang = "0.17.0"
 handlebars = "3.5.4"
 serde = { version = "1.0", features = ["derive"] }
-petgraph = "0.5.1"
 indexmap = "1.6.2"
+
+[dev-dependencies]
+capnp = "0.14.1"
+capnp-rpc = "0.14.1"
+futures = "0.3.14"
+tokio = { version = "1.5.0", features = ["net", "rt", "macros"]}
+tokio-util = { version = "0.6.6", features = ["compat"] }
+plotters = "0.3.0"
+
+[build-dependencies]
+capnpc = "0.14.3"
