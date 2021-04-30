@@ -18,7 +18,7 @@ fn plot(mut data: HashMap<String, Vec<f64>>) -> Result<(), Box<dyn std::error::E
         BitMapBackend::new("plot.png", (1024, 768)).into_drawing_area();
     root.fill(&WHITE)?;
 
-    let colors = vec![&BLACK, &BLUE, &CYAN, &GREEN, &MAGENTA, &RED, &YELLOW];
+    let colors = vec![BLACK, BLUE, CYAN, GREEN, MAGENTA, RED, YELLOW];
     let colorcycle = colors.iter().cycle();
 
     let mut chart = ChartBuilder::on(&root)
@@ -44,15 +44,15 @@ fn plot(mut data: HashMap<String, Vec<f64>>) -> Result<(), Box<dyn std::error::E
         .draw()?;
 
     for ((key, val), color) in data.iter().zip(colorcycle) {
-       let series = LineSeries::new(time.clone().into_iter().zip(val.clone().into_iter()), *color); 
+       let series = LineSeries::new(time.clone().into_iter().zip(val.clone().into_iter()), color); 
        if key.contains("#") || key.contains("@") {
             chart.draw_secondary_series(series)?
                  .label(key)
-                 .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLACK));
+                 .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], color));
        } else {
             chart.draw_series(series)?
                 .label(key)
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLACK));
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], color));
        }
     }
 
